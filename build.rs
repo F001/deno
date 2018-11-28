@@ -5,10 +5,15 @@
 #![deny(warnings)]
 
 use std::env;
+use std::fs::File;
+use std::io::Write;
 use std::path::{self, Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+  // We want to extract version number from Cargo.toml.
+  gen_version_number();
+
   // Cargo sets PROFILE to either "debug" or "release", which conveniently
   // matches the build modes we support.
   let mode = env::var("PROFILE").unwrap();
@@ -82,4 +87,17 @@ fn abs_path<P: AsRef<Path>>(path: P) -> String {
     .chars()
     .map(|c| if path::is_separator(c) { '/' } else { c })
     .collect()
+}
+
+// Save current crate's version into a const string, which will be included in
+// our source code.
+fn gen_version_number() {
+  println!("Generate version_num.rs");
+  let out_dir = env::var("OUT_DIR").unwrap();
+  let ver_path = Path::new(&out_dir).join("version_num.rs");
+  let mut f = File::create(&ver_path).unwrap();
+
+  let ver = env::var("CARGO_PKG_VERSION").unwrap();
+  let output = format!(r#"pub const DENO: &'static str = "{}";"#, ver);
+  f.write_all(output.as_bytes()).unwrap();
 }
