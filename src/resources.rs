@@ -41,19 +41,44 @@ pub type ResourceId = u32; // Sometimes referred to RID.
 
 // These store Deno's file descriptors. These are not necessarily the operating
 // system ones.
-type ResourceTable = HashMap<ResourceId, Repr>;
+struct ResourceTable(Mutex<HashMap<ResourceId, Repr>>);
+
+impl ResourceTable {
+  fn run_with<F, R>(&self, rid: ResourceId, f: F) -> R
+  where
+    F: FnOnce(&mut Repr) -> R,
+  {
+    let mut table = self.0.lock().expect("ResourceTable is poisoned");
+    let mut maybe_repr = table.get_mut(&rid);
+    match maybe_repr {
+      None => panic!("bad rid {}", rid),
+      Some(ref mut repr) => f(repr),
+    }
+  }
+
+  fn insert(&self, repr: Repr) -> Resource {
+    let rid = new_rid();
+    debug!("Create new resource {}", rid);
+    let mut table = self.0.lock().expect("ResourceTable is poisoned");
+
+    match table.insert(rid, repr) {
+      Some(_) => panic!("There is already a file with that rid"),
+      None => Resource { rid },
+    }
+  }
+}
 
 lazy_static! {
   // Starts at 3 because stdio is [0-2].
   static ref NEXT_RID: AtomicUsize = AtomicUsize::new(3);
-  static ref RESOURCE_TABLE: Mutex<ResourceTable> = Mutex::new({
+  static ref RESOURCE_TABLE: ResourceTable = ResourceTable(Mutex::new({
     let mut m = HashMap::new();
     // TODO Load these lazily during lookup?
     m.insert(0, Repr::Stdin(tokio::io::stdin()));
     m.insert(1, Repr::Stdout(tokio::io::stdout()));
     m.insert(2, Repr::Stderr(tokio::io::stderr()));
     m
-  });
+  }));
 }
 
 // Internal representation of Resource.
@@ -73,7 +98,7 @@ enum Repr {
 }
 
 pub fn table_entries() -> Vec<(u32, String)> {
-  let table = RESOURCE_TABLE.lock().unwrap();
+  let table = RESOURCE_TABLE.0.lock().unwrap();
 
   table
     .iter()
@@ -120,37 +145,28 @@ pub struct Resource {
 impl Resource {
   // TODO Should it return a Resource instead of net::TcpStream?
   pub fn poll_accept(&mut self) -> Poll<(TcpStream, SocketAddr), Error> {
-    let mut table = RESOURCE_TABLE.lock().unwrap();
-    let maybe_repr = table.get_mut(&self.rid);
-    match maybe_repr {
-      None => panic!("bad rid"),
-      Some(repr) => match repr {
-        Repr::TcpListener(ref mut s) => s.poll_accept(),
-        _ => panic!("Cannot accept"),
-      },
-    }
+    RESOURCE_TABLE.run_with(self.rid, |repr| match repr {
+      Repr::TcpListener(ref mut s) => s.poll_accept(),
+      _ => panic!("Cannot accept"),
+    })
   }
 
   // close(2) is done by dropping the value. Therefore we just need to remove
   // the resource from the RESOURCE_TABLE.
-  pub fn close(&mut self) {
-    let mut table = RESOURCE_TABLE.lock().unwrap();
+  pub fn close(self) {
+    debug!("Remove resource {}", self.rid);
+    let mut table = RESOURCE_TABLE.0.lock().unwrap();
     let r = table.remove(&self.rid);
     assert!(r.is_some());
   }
 
   pub fn shutdown(&mut self, how: Shutdown) -> Result<(), DenoError> {
-    let mut table = RESOURCE_TABLE.lock().unwrap();
-    let maybe_repr = table.get_mut(&self.rid);
-    match maybe_repr {
-      None => panic!("bad rid"),
-      Some(repr) => match repr {
-        Repr::TcpStream(ref mut f) => {
-          TcpStream::shutdown(f, how).map_err(DenoError::from)
-        }
-        _ => panic!("Cannot shutdown"),
-      },
-    }
+    RESOURCE_TABLE.run_with(self.rid, |repr| match repr {
+      Repr::TcpStream(ref mut f) => {
+        TcpStream::shutdown(f, how).map_err(DenoError::from)
+      }
+      _ => panic!("Cannot shutdown"),
+    })
   }
 }
 
@@ -162,20 +178,15 @@ impl Read for Resource {
 
 impl AsyncRead for Resource {
   fn poll_read(&mut self, buf: &mut [u8]) -> Poll<usize, Error> {
-    let mut table = RESOURCE_TABLE.lock().unwrap();
-    let maybe_repr = table.get_mut(&self.rid);
-    match maybe_repr {
-      None => panic!("bad rid"),
-      Some(repr) => match repr {
-        Repr::FsFile(ref mut f) => f.poll_read(buf),
-        Repr::Stdin(ref mut f) => f.poll_read(buf),
-        Repr::TcpStream(ref mut f) => f.poll_read(buf),
-        Repr::HttpBody(ref mut f) => f.poll_read(buf),
-        Repr::ChildStdout(ref mut f) => f.poll_read(buf),
-        Repr::ChildStderr(ref mut f) => f.poll_read(buf),
-        _ => panic!("Cannot read"),
-      },
-    }
+    RESOURCE_TABLE.run_with(self.rid, |repr| match repr {
+      Repr::FsFile(ref mut f) => f.poll_read(buf),
+      Repr::Stdin(ref mut f) => f.poll_read(buf),
+      Repr::TcpStream(ref mut f) => f.poll_read(buf),
+      Repr::HttpBody(ref mut f) => f.poll_read(buf),
+      Repr::ChildStdout(ref mut f) => f.poll_read(buf),
+      Repr::ChildStderr(ref mut f) => f.poll_read(buf),
+      _ => panic!("Cannot read"),
+    })
   }
 }
 
@@ -191,19 +202,14 @@ impl Write for Resource {
 
 impl AsyncWrite for Resource {
   fn poll_write(&mut self, buf: &[u8]) -> Poll<usize, Error> {
-    let mut table = RESOURCE_TABLE.lock().unwrap();
-    let maybe_repr = table.get_mut(&self.rid);
-    match maybe_repr {
-      None => panic!("bad rid"),
-      Some(repr) => match repr {
-        Repr::FsFile(ref mut f) => f.poll_write(buf),
-        Repr::Stdout(ref mut f) => f.poll_write(buf),
-        Repr::Stderr(ref mut f) => f.poll_write(buf),
-        Repr::TcpStream(ref mut f) => f.poll_write(buf),
-        Repr::ChildStdin(ref mut f) => f.poll_write(buf),
-        _ => panic!("Cannot write"),
-      },
-    }
+    RESOURCE_TABLE.run_with(self.rid, |repr| match repr {
+      Repr::FsFile(ref mut f) => f.poll_write(buf),
+      Repr::Stdout(ref mut f) => f.poll_write(buf),
+      Repr::Stderr(ref mut f) => f.poll_write(buf),
+      Repr::TcpStream(ref mut f) => f.poll_write(buf),
+      Repr::ChildStdin(ref mut f) => f.poll_write(buf),
+      _ => panic!("Cannot write"),
+    })
   }
 
   fn shutdown(&mut self) -> futures::Poll<(), std::io::Error> {
@@ -217,45 +223,29 @@ fn new_rid() -> ResourceId {
 }
 
 pub fn add_fs_file(fs_file: tokio::fs::File) -> Resource {
-  let rid = new_rid();
-  let mut tg = RESOURCE_TABLE.lock().unwrap();
-  match tg.insert(rid, Repr::FsFile(fs_file)) {
-    Some(_) => panic!("There is already a file with that rid"),
-    None => Resource { rid },
-  }
+  let repr = Repr::FsFile(fs_file);
+  RESOURCE_TABLE.insert(repr)
 }
 
 pub fn add_tcp_listener(listener: tokio::net::TcpListener) -> Resource {
-  let rid = new_rid();
-  let mut tg = RESOURCE_TABLE.lock().unwrap();
-  let r = tg.insert(rid, Repr::TcpListener(listener));
-  assert!(r.is_none());
-  Resource { rid }
+  let repr = Repr::TcpListener(listener);
+  RESOURCE_TABLE.insert(repr)
 }
 
 pub fn add_tcp_stream(stream: tokio::net::TcpStream) -> Resource {
-  let rid = new_rid();
-  let mut tg = RESOURCE_TABLE.lock().unwrap();
-  let r = tg.insert(rid, Repr::TcpStream(stream));
-  assert!(r.is_none());
-  Resource { rid }
+  let repr = Repr::TcpStream(stream);
+  RESOURCE_TABLE.insert(repr)
 }
 
 pub fn add_hyper_body(body: hyper::Body) -> Resource {
-  let rid = new_rid();
-  let mut tg = RESOURCE_TABLE.lock().unwrap();
   let body = HttpBody::from(body);
-  let r = tg.insert(rid, Repr::HttpBody(body));
-  assert!(r.is_none());
-  Resource { rid }
+  let repr = Repr::HttpBody(body);
+  RESOURCE_TABLE.insert(repr)
 }
 
 pub fn add_repl(repl: Repl) -> Resource {
-  let rid = new_rid();
-  let mut tg = RESOURCE_TABLE.lock().unwrap();
-  let r = tg.insert(rid, Repr::Repl(repl));
-  assert!(r.is_none());
-  Resource { rid }
+  let repr = Repr::Repl(repl);
+  RESOURCE_TABLE.insert(repr)
 }
 
 pub struct ChildResources {
@@ -266,42 +256,29 @@ pub struct ChildResources {
 }
 
 pub fn add_child(mut c: tokio_process::Child) -> ChildResources {
-  let child_rid = new_rid();
-  let mut tg = RESOURCE_TABLE.lock().unwrap();
+  let stdin_rid = c
+    .stdin()
+    .take()
+    .map(|fd| RESOURCE_TABLE.insert(Repr::ChildStdin(fd)).rid);
 
-  let mut resources = ChildResources {
+  let stdout_rid = c
+    .stdout()
+    .take()
+    .map(|fd| RESOURCE_TABLE.insert(Repr::ChildStdout(fd)).rid);
+
+  let stderr_rid = c
+    .stderr()
+    .take()
+    .map(|fd| RESOURCE_TABLE.insert(Repr::ChildStderr(fd)).rid);
+
+  let child_rid = RESOURCE_TABLE.insert(Repr::Child(c)).rid;
+
+  return ChildResources {
     child_rid,
-    stdin_rid: None,
-    stdout_rid: None,
-    stderr_rid: None,
+    stdin_rid,
+    stdout_rid,
+    stderr_rid,
   };
-
-  if c.stdin().is_some() {
-    let stdin = c.stdin().take().unwrap();
-    let rid = new_rid();
-    let r = tg.insert(rid, Repr::ChildStdin(stdin));
-    assert!(r.is_none());
-    resources.stdin_rid = Some(rid);
-  }
-  if c.stdout().is_some() {
-    let stdout = c.stdout().take().unwrap();
-    let rid = new_rid();
-    let r = tg.insert(rid, Repr::ChildStdout(stdout));
-    assert!(r.is_none());
-    resources.stdout_rid = Some(rid);
-  }
-  if c.stderr().is_some() {
-    let stderr = c.stderr().take().unwrap();
-    let rid = new_rid();
-    let r = tg.insert(rid, Repr::ChildStderr(stderr));
-    assert!(r.is_none());
-    resources.stderr_rid = Some(rid);
-  }
-
-  let r = tg.insert(child_rid, Repr::Child(c));
-  assert!(r.is_none());
-
-  return resources;
 }
 
 pub struct ChildStatus {
@@ -314,39 +291,33 @@ impl Future for ChildStatus {
   type Error = DenoError;
 
   fn poll(&mut self) -> Poll<ExitStatus, DenoError> {
-    let mut table = RESOURCE_TABLE.lock().unwrap();
-    let maybe_repr = table.get_mut(&self.rid);
-    match maybe_repr {
-      Some(Repr::Child(ref mut child)) => child.poll().map_err(DenoError::from),
-      _ => Err(bad_resource()),
-    }
+    RESOURCE_TABLE.run_with(self.rid, |repr| match repr {
+      Repr::Child(ref mut child) => child.poll().map_err(DenoError::from),
+      _ => Err(bad_resource(self.rid)),
+    })
   }
 }
 
 pub fn child_status(rid: ResourceId) -> DenoResult<ChildStatus> {
-  let mut table = RESOURCE_TABLE.lock().unwrap();
-  let maybe_repr = table.get_mut(&rid);
-  match maybe_repr {
-    Some(Repr::Child(ref mut _child)) => Ok(ChildStatus { rid }),
-    _ => Err(bad_resource()),
-  }
+  RESOURCE_TABLE.run_with(rid, |repr| match repr {
+    Repr::Child(_) => Ok(ChildStatus { rid }),
+    _ => Err(bad_resource(rid)),
+  })
 }
 
 pub fn readline(rid: ResourceId, prompt: &str) -> DenoResult<String> {
-  let mut table = RESOURCE_TABLE.lock().unwrap();
-  let maybe_repr = table.get_mut(&rid);
-  match maybe_repr {
-    Some(Repr::Repl(ref mut r)) => {
+  RESOURCE_TABLE.run_with(rid, |repr| match repr {
+    Repr::Repl(ref mut r) => {
       let line = r.readline(&prompt)?;
       Ok(line)
     }
-    _ => Err(bad_resource()),
-  }
+    _ => Err(bad_resource(rid)),
+  })
 }
 
 pub fn lookup(rid: ResourceId) -> Option<Resource> {
   debug!("resource lookup {}", rid);
-  let table = RESOURCE_TABLE.lock().unwrap();
+  let table = RESOURCE_TABLE.0.lock().unwrap();
   table.get(&rid).map(|_| Resource { rid })
 }
 
@@ -390,17 +361,12 @@ pub fn eager_read<T: AsMut<[u8]>>(
   resource: Resource,
   buf: T,
 ) -> EagerRead<Resource, T> {
-  let mut table = RESOURCE_TABLE.lock().unwrap();
-  let maybe_repr = table.get_mut(&resource.rid);
-  match maybe_repr {
-    None => panic!("bad rid"),
-    Some(repr) => match repr {
-      Repr::TcpStream(ref mut tcp_stream) => {
-        eager::tcp_read(tcp_stream, resource, buf)
-      }
-      _ => Either::A(tokio_io::io::read(resource, buf)),
-    },
-  }
+  RESOURCE_TABLE.run_with(resource.rid, |repr| match repr {
+    Repr::TcpStream(ref mut tcp_stream) => {
+      eager::tcp_read(tcp_stream, resource, buf)
+    }
+    _ => Either::A(tokio_io::io::read(resource, buf)),
+  })
 }
 
 // This is an optimization that Tokio should do.
@@ -410,30 +376,20 @@ pub fn eager_write<T: AsRef<[u8]>>(
   resource: Resource,
   buf: T,
 ) -> EagerWrite<Resource, T> {
-  let mut table = RESOURCE_TABLE.lock().unwrap();
-  let maybe_repr = table.get_mut(&resource.rid);
-  match maybe_repr {
-    None => panic!("bad rid"),
-    Some(repr) => match repr {
-      Repr::TcpStream(ref mut tcp_stream) => {
-        eager::tcp_write(tcp_stream, resource, buf)
-      }
-      _ => Either::A(tokio_write::write(resource, buf)),
-    },
-  }
+  RESOURCE_TABLE.run_with(resource.rid, |repr| match repr {
+    Repr::TcpStream(ref mut tcp_stream) => {
+      eager::tcp_write(tcp_stream, resource, buf)
+    }
+    _ => Either::A(tokio_write::write(resource, buf)),
+  })
 }
 
 #[cfg(unix)]
 pub fn eager_accept(resource: Resource) -> EagerAccept {
-  let mut table = RESOURCE_TABLE.lock().unwrap();
-  let maybe_repr = table.get_mut(&resource.rid);
-  match maybe_repr {
-    None => panic!("bad rid"),
-    Some(repr) => match repr {
-      Repr::TcpListener(ref mut tcp_listener) => {
-        eager::tcp_accept(tcp_listener, resource)
-      }
-      _ => Either::A(tokio_util::accept(resource)),
-    },
-  }
+  RESOURCE_TABLE.run_with(resource.rid, |repr| match repr {
+    Repr::TcpListener(ref mut tcp_listener) => {
+      eager::tcp_accept(tcp_listener, resource)
+    }
+    _ => Either::A(tokio_util::accept(resource)),
+  })
 }

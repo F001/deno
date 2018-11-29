@@ -149,8 +149,8 @@ impl From<hyper::Error> for DenoError {
   }
 }
 
-pub fn bad_resource() -> DenoError {
-  new(ErrorKind::BadResource, String::from("bad resource id"))
+pub fn bad_resource(rid: u32) -> DenoError {
+  new(ErrorKind::BadResource, format!("bad resource id {}", rid))
 }
 
 pub fn permission_denied() -> DenoError {

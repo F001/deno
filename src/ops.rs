@@ -619,8 +619,8 @@ fn op_close(
   let inner = base.inner_as_close().unwrap();
   let rid = inner.rid();
   match resources::lookup(rid) {
-    None => odd_future(errors::bad_resource()),
-    Some(mut resource) => {
+    None => odd_future(errors::bad_resource(rid)),
+    Some(resource) => {
       resource.close();
       ok_future(empty_buf())
     }
@@ -637,7 +637,7 @@ fn op_shutdown(
   let rid = inner.rid();
   let how = inner.how();
   match resources::lookup(rid) {
-    None => odd_future(errors::bad_resource()),
+    None => odd_future(errors::bad_resource(rid)),
     Some(mut resource) => {
       let shutdown_mode = match how {
         0 => Shutdown::Read,
@@ -663,7 +663,7 @@ fn op_read(
   let rid = inner.rid();
 
   match resources::lookup(rid) {
-    None => odd_future(errors::bad_resource()),
+    None => odd_future(errors::bad_resource(rid)),
     Some(resource) => {
       let op = resources::eager_read(resource, data)
         .map_err(DenoError::from)
@@ -701,7 +701,7 @@ fn op_write(
   let rid = inner.rid();
 
   match resources::lookup(rid) {
-    None => odd_future(errors::bad_resource()),
+    None => odd_future(errors::bad_resource(rid)),
     Some(resource) => {
       let op = resources::eager_write(resource, data)
         .map_err(DenoError::from)
@@ -1247,7 +1247,7 @@ fn op_accept(
   let server_rid = inner.rid();
 
   match resources::lookup(server_rid) {
-    None => odd_future(errors::bad_resource()),
+    None => odd_future(errors::bad_resource(server_rid)),
     Some(server_resource) => {
       let op = resources::eager_accept(server_resource)
         .map_err(DenoError::from)
