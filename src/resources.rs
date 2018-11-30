@@ -20,6 +20,7 @@ use tokio_write;
 
 use futures;
 use futures::future::{Either, FutureResult};
+use futures::sync::oneshot;
 use futures::Future;
 use futures::Poll;
 use hyper;
@@ -28,9 +29,11 @@ use std::collections::HashMap;
 use std::io::{Error, Read, Write};
 use std::net::{Shutdown, SocketAddr};
 use std::process::ExitStatus;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::thread;
 use tokio;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -64,6 +67,219 @@ impl ResourceTable {
     match table.insert(rid, repr) {
       Some(_) => panic!("There is already a file with that rid"),
       None => Resource { rid },
+    }
+  }
+}
+
+struct ResourceTable2 {
+  rid_gen: u32,
+  table: HashMap<ResourceId, Repr>,
+}
+
+impl ResourceTable2 {
+
+  fn insert(&mut self, repr: Repr) -> Resource {
+    self.rid_gen = self
+      .rid_gen
+      .checked_add(1)
+      .expect("resource id is exhausted");
+    match self.table.insert(self.rid_gen, repr) {
+      Some(_) => panic!("There is already a file with that rid"),
+      None => Resource { rid: self.rid_gen },
+    }
+  }
+}
+
+enum WorkItem {
+  Insert {
+    repr: Repr,
+    tx: oneshot::Sender<Resource>,
+  },
+  InsertChild {
+    child: tokio_process::Child,
+    tx: oneshot::Sender<ChildResources>,
+  },
+  CollectEntries {
+    tx: oneshot::Sender<Vec<(u32, String)>>,
+  },
+}
+
+pub enum ResourceItem {
+  Insert(Resource),
+  InsertChild(ChildResources),
+  CollectEntries(Vec<(u32, String)>),
+}
+
+pub enum ResourceFuture {
+  Insert {
+    rx: oneshot::Receiver<Resource>,
+  },
+  InsertChild {
+    rx: oneshot::Receiver<ChildResources>,
+  },
+  CollectEntries {
+    rx: oneshot::Receiver<Vec<(u32, String)>>,
+  },
+}
+
+impl Future for ResourceFuture {
+  type Item = ResourceItem;
+  type Error = futures::Canceled;
+
+  fn poll(&mut self) -> Poll<ResourceItem, futures::Canceled> {
+    match self {
+      ResourceFuture::Insert { rx } => {
+        rx.poll().map(|r| r.map(|x| ResourceItem::Insert(x)))
+      }
+      ResourceFuture::InsertChild { rx } => {
+        rx.poll().map(|r| r.map(|x| ResourceItem::InsertChild(x)))
+      }
+      ResourceFuture::CollectEntries { rx } => rx
+        .poll()
+        .map(|r| r.map(|x| ResourceItem::CollectEntries(x))),
+    }
+  }
+}
+
+static RESOURCE_THREAD_RUNNING: AtomicBool = AtomicBool::new(true);
+static mut THE_INSTANCE: Option<&'static Arc<ResourceManager>> = None;
+static THE_INIT: std::sync::Once = std::sync::ONCE_INIT;
+
+pub fn instance() -> &'static Arc<ResourceManager> {
+  THE_INIT.call_once(|| unsafe {
+    let r = Arc::new(ResourceManager::new());
+    let p = util::leak(r);
+    THE_INSTANCE = Some(p);
+  });
+  unsafe {
+    THE_INSTANCE.expect("The global resource manager has not been initialized.")
+  }
+}
+
+pub struct ResourceManager {
+  tx: std::sync::mpsc::Sender<WorkItem>,
+}
+
+impl ResourceManager {
+  fn new() -> Self {
+    let (tx, rx) = std::sync::mpsc::channel::<WorkItem>();
+    thread::spawn(|| {
+      let mut res_table: ResourceTable2 = ResourceTable2 {
+        rid_gen: 3,
+        table: {
+          let mut m = HashMap::new();
+          m.insert(0, Repr::Stdin(tokio::io::stdin()));
+          m.insert(1, Repr::Stdout(tokio::io::stdout()));
+          m.insert(2, Repr::Stderr(tokio::io::stderr()));
+          m
+        },
+      };
+      let rx = rx;
+      while RESOURCE_THREAD_RUNNING.load(Ordering::SeqCst) {
+        if let Ok(item) = rx.recv() {
+          match item {
+            WorkItem::Insert { repr, tx } => {
+              tx.send(res_table.insert(repr)).unwrap();
+            }
+            WorkItem::InsertChild { mut child, tx } => {
+              let stdin_rid = child
+                .stdin()
+                .take()
+                .map(|fd| res_table.insert(Repr::ChildStdin(fd)).rid);
+
+              let stdout_rid = child
+                .stdout()
+                .take()
+                .map(|fd| res_table.insert(Repr::ChildStdout(fd)).rid);
+
+              let stderr_rid = child
+                .stderr()
+                .take()
+                .map(|fd| res_table.insert(Repr::ChildStderr(fd)).rid);
+
+              let child_rid = res_table.insert(Repr::Child(child)).rid;
+
+              tx.send(ChildResources {
+                child_rid,
+                stdin_rid,
+                stdout_rid,
+                stderr_rid,
+              }).unwrap();
+            }
+            WorkItem::CollectEntries { tx } => {
+              let all = res_table
+                .table
+                .iter()
+                .map(|(key, value)| (*key, inspect_repr(&value)))
+                .collect();
+              tx.send(all).unwrap();
+            }
+          }
+        } else {
+          return;
+        }
+      }
+    });
+    ResourceManager { tx }
+  }
+
+  fn spawn_insert(&self, repr: Repr) -> ResourceFuture {
+    let (tx, rx) = oneshot::channel();
+    let w = WorkItem::Insert { repr, tx };
+    self.tx.send(w).expect("resource manager thread is dead");
+    ResourceFuture::Insert { rx }
+  }
+
+  pub fn add_fs_file(&self, fs_file: tokio::fs::File) -> ResourceFuture {
+    let repr = Repr::FsFile(fs_file);
+    self.spawn_insert(repr)
+  }
+
+  pub fn add_tcp_listener(
+    &self,
+    listener: tokio::net::TcpListener,
+  ) -> ResourceFuture {
+    let repr = Repr::TcpListener(listener);
+    self.spawn_insert(repr)
+  }
+
+  pub fn add_tcp_stream(
+    &self,
+    stream: tokio::net::TcpStream,
+  ) -> ResourceFuture {
+    let repr = Repr::TcpStream(stream);
+    self.spawn_insert(repr)
+  }
+
+  pub fn add_hyper_body(&self, body: hyper::Body) -> ResourceFuture {
+    let body = HttpBody::from(body);
+    let repr = Repr::HttpBody(body);
+    self.spawn_insert(repr)
+  }
+
+  pub fn add_repl(&self, repl: Repl) -> ResourceFuture {
+    let repr = Repr::Repl(repl);
+    self.spawn_insert(repr)
+  }
+
+  pub fn add_child(&self, child: tokio_process::Child) -> ResourceFuture {
+    let (tx, rx) = oneshot::channel();
+    let w = WorkItem::InsertChild { child, tx };
+    self.tx.send(w).expect("resource manager thread is dead");
+    ResourceFuture::InsertChild { rx }
+  }
+
+  pub fn table_entries(&self) -> ResourceFuture {
+    let (tx, rx) = oneshot::channel();
+    let w = WorkItem::CollectEntries { tx };
+    self.tx.send(w).expect("resource manager thread is dead");
+    ResourceFuture::CollectEntries { rx }
+  }
+
+  pub fn close(&self) {
+    RESOURCE_THREAD_RUNNING.store(false, Ordering::SeqCst);
+    unsafe {
+      THE_INSTANCE = None;
     }
   }
 }
@@ -248,6 +464,7 @@ pub fn add_repl(repl: Repl) -> Resource {
   RESOURCE_TABLE.insert(repr)
 }
 
+#[derive(Debug)]
 pub struct ChildResources {
   pub child_rid: ResourceId,
   pub stdin_rid: Option<ResourceId>,
@@ -392,4 +609,17 @@ pub fn eager_accept(resource: Resource) -> EagerAccept {
     }
     _ => Either::A(tokio_util::accept(resource)),
   })
+}
+
+mod util {
+  use std::mem;
+  // copied from rayon-core project
+  pub fn leak<T>(v: T) -> &'static T {
+    unsafe {
+      let b = Box::new(v);
+      let p: *const T = &*b;
+      mem::forget(b); // leak our reference, so that `b` is never freed
+      &*p
+    }
+  }
 }
