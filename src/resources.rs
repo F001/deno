@@ -37,6 +37,7 @@ use std::thread;
 use tokio;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::prelude::task::AtomicTask;
 use tokio_io;
 use tokio_process;
 
@@ -78,6 +79,17 @@ struct ResourceTable2 {
 
 impl ResourceTable2 {
 
+  fn run_with<F, R>(&self, rid: ResourceId, f: F) -> R
+  where
+    F: FnOnce(&mut Repr) -> R,
+  {
+    let mut maybe_repr = self.table.get_mut(&rid);
+    match maybe_repr {
+      None => panic!("bad rid {}", rid),
+      Some(ref mut repr) => f(repr),
+    }
+  }
+
   fn insert(&mut self, repr: Repr) -> Resource {
     self.rid_gen = self
       .rid_gen
@@ -102,12 +114,18 @@ enum WorkItem {
   CollectEntries {
     tx: oneshot::Sender<Vec<(u32, String)>>,
   },
+  Accept {
+    task: AtomicTask,
+    r: Resource,
+    tx: oneshot::Sender<(TcpStream, SocketAddr)>,
+  }
 }
 
 pub enum ResourceItem {
   Insert(Resource),
   InsertChild(ChildResources),
   CollectEntries(Vec<(u32, String)>),
+  Accept((TcpStream, SocketAddr)),
 }
 
 pub enum ResourceFuture {
@@ -120,6 +138,9 @@ pub enum ResourceFuture {
   CollectEntries {
     rx: oneshot::Receiver<Vec<(u32, String)>>,
   },
+  Accept {
+    rx: oneshot::Receiver<(TcpStream, SocketAddr)>,
+  }
 }
 
 impl Future for ResourceFuture {
@@ -137,6 +158,11 @@ impl Future for ResourceFuture {
       ResourceFuture::CollectEntries { rx } => rx
         .poll()
         .map(|r| r.map(|x| ResourceItem::CollectEntries(x))),
+      ResourceFuture::Accept { rx } => {
+        rx
+        .poll()
+        .map(|r| r.map(|x| ResourceItem::Accept(x))),
+      }
     }
   }
 }
@@ -214,6 +240,14 @@ impl ResourceManager {
                 .collect();
               tx.send(all).unwrap();
             }
+            WorkItem::Accept { task, r, tx } => {
+              res_table.run_with(r.rid, |repr|
+              match repr {
+                Repr::TcpListener(ref mut s) => s.poll_accept(),
+                _ => panic!("Cannot accept"),
+              });
+              task.notify();
+            }
           }
         } else {
           return;
@@ -274,6 +308,15 @@ impl ResourceManager {
     let w = WorkItem::CollectEntries { tx };
     self.tx.send(w).expect("resource manager thread is dead");
     ResourceFuture::CollectEntries { rx }
+  }
+
+  pub fn poll_accept(&self, r: Resource) -> ResourceFuture {
+    let (tx, rx) = oneshot::channel();
+    let task = AtomicTask::new();
+    task.register();
+    let w = WorkItem::Accept { task, r, tx };
+    self.tx.send(w).expect("resource manager thread is dead");
+    ResourceFuture::Accept { rx }
   }
 
   pub fn close(&self) {
